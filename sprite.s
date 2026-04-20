@@ -67,6 +67,7 @@ sam_y = $01         ; Sam's Y position (top row, 0–255)
 frame_timer = $02
 anim_frame = $03
 moving = $04
+sound_timer = $05
 
 ; =============================================================================
 ; Data tables — live in PRG-ROM (read-only, CPU can index into them)
@@ -276,6 +277,13 @@ attr_data:
     lda #$88            ; %10001000 = bit 7 NMI enable, bit 3 sprites use $1000, bit 4 BG uses $0000
     sta PPUCTRL
 
+    ; --- Enable APU Pulse 1 ---
+    lda #$01
+    sta $4015           ; bit 0 = pulse 1 on
+
+    lda #$08            ; %00001000 — sweep disabled, negate=1, shift=0
+    sta $4001           ; negate bit prevents overflow silencing at low frequencies
+
     ; --- Spin forever — all real work happens in nmi_handler ---
 @loop:
     jmp @loop
@@ -370,13 +378,37 @@ attr_data:
     sta $020F           ; sprite 3 X  (right column, row 1)
     sta $0217           ; sprite 5 X  (right column, row 2)
 
+    ; --- Movement chirp ---
+    lda moving
+    beq @no_moving_sound
+    inc sound_timer
+    lda sound_timer
+    cmp #$10
+    bne @no_moving_sound
+        lda #$00
+        sta sound_timer
+        lda #$BF        ; %10_11_1111
+                        ;   1111       volume:           1111 = 15 (max)
+                        ;   1          length halt:      1 = hold note (ignore length counter)
+                        ;   1          constant volume:  1 = fixed level (not envelope)
+                        ;  10          duty cycle:       10 = 50% square wave
+        sta $4000
+        lda #$F1        ; A1 Note
+        sta $4002
+        lda #$0F        ; retrigger length counter, restart note
+        sta $4003
+        jmp @after_moving_sound
+@no_moving_sound:
+    lda #$00
+    sta $4000           ; silence when not moving
+@after_moving_sound:
+
     ; --- Animation timer ---
     lda moving
     bne @do_anim
     lda #$00
     sta anim_frame
     jmp @skip_anim
-
 @do_anim:
     inc frame_timer
     lda frame_timer
