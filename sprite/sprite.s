@@ -1,10 +1,18 @@
 ; =============================================================================
-; NES Sprite Demo — Day 6
-; A face sprite glides across the screen, driven by the NMI/VBlank interrupt.
+; NES Sprite Demo — Day 7 (Sound Design)
+; Sam the robot walks around and plays a musical note per direction:
+;   Up    → G4 (~392 Hz)
+;   Down  → A4 (~440 Hz)
+;   Left  → E4 (~330 Hz)
+;   Right → C4 (~262 Hz)
 ;
 ; Memory map (CPU RAM):
-;   $0000         sprite_x   — zero-page variable tracking sprite 1's X position
-;   $0200–$02FF   shadow OAM — sprite data staged here, DMA'd to PPU each frame
+;   $0000  sam_x        — Sam's X position
+;   $0001  sam_y        — Sam's Y position
+;   $0002  frame_timer  — animation frame timer
+;   $0003  anim_frame   — current animation frame (0 or 1)
+;   $0004  moving       — nonzero if any direction held this frame
+;   $0200–$02FF shadow OAM — sprite data staged here, DMA'd to PPU each frame
 ;
 ; PPU registers used:
 ;   $2000 PPUCTRL   — NMI enable (bit 7)
@@ -15,6 +23,13 @@
 ;   $2006 PPUADDR   — PPU address pointer (two writes: high then low byte)
 ;   $2007 PPUDATA   — PPU data port (auto-increments after each write)
 ;   $4014 OAMDMA    — triggers DMA copy from CPU RAM page → PPU OAM
+;
+; APU registers used:
+;   $4000  Pulse 1 duty + envelope (volume, constant/envelope, length halt)
+;   $4001  Pulse 1 sweep (disabled)
+;   $4002  Pulse 1 period low byte
+;   $4003  Pulse 1 period high bits + length counter retrigger
+;   $4015  APU channel enable flags
 ; =============================================================================
 
 .segment "HEADER"
@@ -28,20 +43,18 @@
 
 ; =============================================================================
 ; CHR-ROM — tile graphics data (8KB total, 512 tiles of 8×8 pixels)
-; Each tile = 16 bytes: 8 bytes plane 0 + 8 bytes plane 1
-; Each pixel's color index = (plane1 bit << 1) | plane0 bit  →  0, 1, 2, or 3
 ; =============================================================================
 .segment "CHARS_BG"
 
-  ; Tile $00 (PPU $0000) — blank / sky (nametable defaults to 0, so this = empty background)
+  ; Tile $00 — blank sky
   .byte $00, $00, $00, $00, $00, $00, $00, $00  ; plane 0
   .byte $00, $00, $00, $00, $00, $00, $00, $00  ; plane 1
 
-  ; Tile $01  (PPU $0010)
+  ; Tile $01 — grass top edge
   .byte $20, $AA, $76, $DD, $B7, $6D, $DB, $76  ; plane 0
   .byte $00, $00, $89, $22, $48, $92, $24, $89  ; plane 1
 
-  ; Tile $02 (PPU $0020) — grass fill
+  ; Tile $02 — grass fill
   .byte $D5, $AB, $76, $DD, $B7, $6D, $DB, $76  ; plane 0
   .byte $2A, $54, $89, $22, $48, $92, $24, $89  ; plane 1
 
@@ -54,161 +67,196 @@
 ; =============================================================================
 .segment "CODE"
 
-; --- PPU register aliases (makes code readable instead of using raw addresses) ---
-PPUCTRL   = $2000   ; control flags: NMI enable, sprite size, pattern table select
-PPUMASK   = $2001   ; rendering flags: show bg, show sprites, show left-edge columns
-PPUSTATUS = $2002   ; read-only: VBlank flag (bit 7), sprite 0 hit (bit 6)
-PPUADDR   = $2006   ; PPU address bus: write high byte then low byte
-PPUDATA   = $2007   ; PPU data port: read/write PPU memory at current PPUADDR
+; --- PPU register aliases ---
+PPUCTRL   = $2000
+PPUMASK   = $2001
+PPUSTATUS = $2002
+PPUADDR   = $2006
+PPUDATA   = $2007
 
-; --- Zero-page variables (fast RAM — single-byte address = shorter, faster instructions) ---
-sam_x = $00         ; Sam's X position (left edge of left column, 0–255)
-sam_y = $01         ; Sam's Y position (top row, 0–255)
+; --- Zero-page variables ---
+sam_x       = $00
+sam_y       = $01
 frame_timer = $02
-anim_frame = $03
-moving = $04
+anim_frame  = $03
+moving      = $04
 sound_timer = $05
+duty_cycle  = $06
+note_index  = $07   ; which note to play this frame (set during button reads)
 
 ; =============================================================================
-; Data tables — live in PRG-ROM (read-only, CPU can index into them)
+; Data tables
 ; =============================================================================
 
-; =============================================================================
-; Sam — 2×4 meta-sprite (8 OAM entries, tiles $00–$07 from SPR pattern table)
-;
-; Tile layout:
-;   [$00][$01]   row 0  (top)
-;   [$02][$03]   row 1
-;   [$04][$05]   row 2
-;   [$06][$07]   row 3  (bottom, feet at grass line)
-;
-; OAM format per entry: [Y, tile, attributes, X]
-;   Y = scanline the sprite appears on (sprite draws on Y+1, so subtract 1 from desired row)
-;   X = left edge of sprite in pixels
-;   Attributes = %vhpppppp  (v=flip-V, h=flip-H, pp=palette 0–3)
-;
-; Sam is centered at X=120 (two tiles: $78 and $80), top at pixel row 184.
-; =============================================================================
 sam_oam:
-    .byte $B7, $00, $00, $78   ; row 0 left  — tile $00, Y=184, X=120
-    .byte $B7, $01, $00, $80   ; row 0 right — tile $01, Y=184, X=128
-    .byte $BF, $10, $00, $78   ; row 1 left  — tile $02, Y=192, X=120
-    .byte $BF, $11, $00, $80   ; row 1 right — tile $03, Y=192, X=128
-    .byte $C7, $20, $00, $78   ; row 2 left  — tile $04, Y=200, X=120
-    .byte $C7, $21, $00, $80   ; row 2 right — tile $05, Y=200, X=128
+    .byte $B7, $00, $00, $78   ; row 0 left
+    .byte $B7, $01, $00, $80   ; row 0 right
+    .byte $BF, $10, $00, $78   ; row 1 left
+    .byte $BF, $11, $00, $80   ; row 1 right
+    .byte $C7, $20, $00, $78   ; row 2 left
+    .byte $C7, $21, $00, $80   ; row 2 right
 
 anim_tiles:
     .byte $00, $01, $02, $03
     .byte $10, $11, $12, $13
     .byte $20, $21, $22, $23
 
-; Palettes: 8 total × 4 bytes = 32 bytes, written to PPU $3F00–$3F1F
-;   $3F00–$3F0F = background palettes 0–3
-;   $3F10–$3F1F = sprite palettes 0–3  (PPU mirrors $3F10/$3F14/$3F18/$3F1C back to $3F00,
-;                                        but the color slots $3F11–$3F13 etc. are independent)
-; Byte 0 of each palette = color index 0 = transparent/universal BG color
+; =============================================================================
+; Note period tables — C major scale, octave 2 (C2–C3)
+;
+; Period formula (NTSC): period = 1,789,773 / (16 × frequency) - 1
+; The 11-bit period splits across two registers:
+;   $4002 = low 8 bits
+;   $4003 bits 2-0 = high 3 bits  (bits 7-3 = length counter load)
+;
+; Periods are ~4× larger than octave 4 — frequency halves each octave down,
+; so period doubles. Octave 2 = two doublings from octave 4.
+;
+; Index:    0     1     2     3     4     5     6     7
+; Note:     C2    D2    E2    F2    G2    A2    B2    C3
+; Freq(Hz): 65    73    82    87    98   110   123   131
+; Period:  1709  1523  1357  1280  1140  1016   905   854
+; =============================================================================
+note_lo:
+    .byte $AD   ; C2  period = $06AD
+    .byte $F3   ; D2  period = $05F3
+    .byte $4D   ; E2  period = $054D
+    .byte $00   ; F2  period = $0500
+    .byte $74   ; G2  period = $0474
+    .byte $F8   ; A2  period = $03F8
+    .byte $89   ; B2  period = $0389
+    .byte $56   ; C3  period = $0356
+
+note_hi:
+    .byte $06   ; C2
+    .byte $05   ; D2
+    .byte $05   ; E2
+    .byte $05   ; F2
+    .byte $04   ; G2
+    .byte $03   ; A2
+    .byte $03   ; B2
+    .byte $03   ; C3
+
 palette_data:
     ; --- Background palettes ---
-    .byte $21, $1A, $08, $26    ; BG  palette 0: sky / green / brown / gold
-    .byte $23, $1A, $28, $17    ; BG  palette 1: dark / green / yellow / orange
-    .byte $23, $14, $2C, $30    ; BG  palette 2: dark / purple / pink / white
-    .byte $23, $11, $1C, $27    ; BG  palette 3: dark / teal / lime / gold
+    .byte $21, $1A, $08, $26
+    .byte $23, $1A, $28, $17
+    .byte $23, $14, $2C, $30
+    .byte $23, $11, $1C, $27
     ; --- Sprite palettes ---
-    .byte $FF, $11, $27, $10    ; SPR palette 0: skin tone / red / gold / white
-    .byte $21, $16, $37, $28    ; SPR palette 1: dark / red / skin / gold
-    .byte $21, $06, $17, $28    ; SPR palette 2: dark / red / orange / yellow
-    .byte $0D, $16, $37, $07    ; slot0=$0D slot1=$05 slot2=$37 slot3=$07
+    .byte $FF, $11, $27, $10
+    .byte $21, $16, $37, $28
+    .byte $21, $06, $17, $28
+    .byte $0D, $16, $37, $07
 
-; Attribute table: 64 bytes covering the full 32×30 nametable ($23C0–$23FF)
-; 8 rows of 8 bytes = 64 entries, each controlling a 4×4 tile block (2 bits per quadrant)
-; All $00 = entire screen uses palette 0
 attr_data:
-    .byte $00,$00,$00,$00,$00,$00,$00,$00  ; rows  0– 3
-    .byte $00,$00,$00,$00,$00,$00,$00,$00  ; rows  4– 7
-    .byte $00,$00,$00,$00,$00,$00,$00,$00  ; rows  8–11
-    .byte $00,$00,$00,$00,$00,$00,$00,$00  ; rows 12–15
-    .byte $00,$00,$00,$00,$00,$00,$00,$00  ; rows 16–19
-    .byte $00,$00,$00,$00,$00,$00,$00,$00  ; rows 20–23
-    .byte $00,$00,$00,$00,$00,$00,$00,$00  ; rows 24–27
-    .byte $00,$00,$00,$00,$00,$00,$00,$00  ; rows 28–31
+    .byte $00,$00,$00,$00,$00,$00,$00,$00
+    .byte $00,$00,$00,$00,$00,$00,$00,$00
+    .byte $00,$00,$00,$00,$00,$00,$00,$00
+    .byte $00,$00,$00,$00,$00,$00,$00,$00
+    .byte $00,$00,$00,$00,$00,$00,$00,$00
+    .byte $00,$00,$00,$00,$00,$00,$00,$00
+    .byte $00,$00,$00,$00,$00,$00,$00,$00
+    .byte $00,$00,$00,$00,$00,$00,$00,$00
+
+; =============================================================================
+; play_note macro — writes to APU pulse 1 registers to sound a note
+;
+; Usage: play_note <index>   where index is 0–7 into note_lo/note_hi
+;
+; $4000: %10_1_1_1111
+;         ││ │ │ └───── volume = 15 (max)
+;         ││ │ └─────── constant volume (not envelope decay)
+;         ││ └───────── length counter halt (hold note until silenced)
+;         └┘─────────── duty cycle 50% (full square wave)
+;
+; $4002: low 8 bits of period
+; $4003: note_hi OR $08
+;   bits 2-0 = high 3 bits of period
+;   bit  3   = part of length counter load — must be nonzero to avoid instant silence
+;   writing $4003 always retrriggers (restarts) the note
+; =============================================================================
+.macro play_note index
+    lda #$BF
+    sta $4000
+    ldx #index
+    lda note_lo,x
+    sta $4002
+    lda note_hi,x
+    ora #$08            ; ensure length counter is nonzero; retrigger note
+    sta $4003
+.endmacro
+
 
 ; =============================================================================
 ; reset_handler — entry point after power-on or reset
-; Runs once to initialize everything, then spins forever in @loop.
-; All per-frame work happens in nmi_handler instead.
 ; =============================================================================
 .proc reset_handler
-    sei             ; disable IRQ interrupts (we only use NMI)
-    cld             ; disable decimal mode (not used on NES hardware)
+    sei
+    cld
     ldx #$FF
-    txs             ; set stack pointer to $01FF (top of stack page)
+    txs
 
-    ; --- Wait for PPU to warm up (takes ~2 VBlanks after power-on) ---
+    ; --- Wait for PPU to warm up ---
 @vblankwait1:
-    bit PPUSTATUS       ; read $2002 — clears address latch, tests VBlank flag (bit 7)
-    bpl @vblankwait1    ; BPL = "branch if plus" = loop while bit 7 is 0 (not VBlank)
-
+    bit PPUSTATUS
+    bpl @vblankwait1
 @vblankwait2:
-    bit PPUSTATUS       ; wait for second VBlank — PPU is fully ready after this
+    bit PPUSTATUS
     bpl @vblankwait2
 
-    ; --- Load background palettes into PPU $3F00 ---
-    bit PPUSTATUS       ; reset address latch (must always do before writing PPUADDR)
+    ; --- Load all 8 palettes (32 bytes) into PPU $3F00 ---
+    bit PPUSTATUS
     lda #$3F
-    sta PPUADDR         ; set PPU address high byte → $3F__
+    sta PPUADDR
     lda #$00
-    sta PPUADDR         ; set PPU address low byte  → $3F00
+    sta PPUADDR
 
     ldx #$00
 @palette_loop:
-    lda palette_data,X  ; load palette byte at index X
-    sta PPUDATA         ; write to PPU (address auto-increments after each write)
+    lda palette_data,X
+    sta PPUDATA
     inx
-    cpx #$20            ; 32 bytes = 8 palettes × 4 bytes (4 BG + 4 sprite)
+    cpx #$20
     bne @palette_loop
 
     ; --- Load attribute table into PPU $23C0 ---
-    ; The attribute table controls which palette each 4×4 tile block uses.
-    lda PPUSTATUS       ; reset address latch
+    lda PPUSTATUS
     lda #$23
-    sta PPUADDR         ; high byte → $23__
+    sta PPUADDR
     lda #$C0
-    sta PPUADDR         ; low byte  → $23C0
+    sta PPUADDR
 
     ldx #$00
 @attr_loop:
     lda attr_data,X
     sta PPUDATA
     inx
-    cpx #$40            ; 64 bytes = full attribute table ($23C0–$23FF)
+    cpx #$40
     bne @attr_loop
 
-    ; --- Write background tiles to nametable ---
-    ; NES nametable = 32×30 grid at PPU $2000. Each byte = tile index to display.
-    ; Rows 0–26 are left at 0 (tile $00 = blank sky — default nametable value).
-    ; Row 27 = tile $01 (grass top edge)   PPU $2360
-    ; Row 28 = tile $02 (grass fill)       PPU $2380
-    ; Row 29 = tile $02 (grass fill)       PPU $23A0
-
+    ; --- Write background tiles ---
+    ; Row 27 ($2360) — grass top
     lda PPUSTATUS
     lda #$23
     sta PPUADDR
-    lda #$60            ; → PPU $2360 (row 27, col 0)
+    lda #$60
     sta PPUADDR
-    lda #$01            ; tile $01 = grass top edge
+    lda #$01
     ldx #$00
 @row27:
     sta PPUDATA
     inx
-    cpx #$20            ; 32 columns
+    cpx #$20
     bne @row27
 
+    ; Row 28 ($2380) — grass fill
     lda PPUSTATUS
     lda #$23
     sta PPUADDR
-    lda #$80            ; → PPU $2380 (row 28, col 0)
+    lda #$80
     sta PPUADDR
-    lda #$02            ; tile $02 = grass fill
+    lda #$02
     ldx #$00
 @row28:
     sta PPUDATA
@@ -216,12 +264,13 @@ attr_data:
     cpx #$20
     bne @row28
 
+    ; Row 29 ($23A0) — grass fill
     lda PPUSTATUS
     lda #$23
     sta PPUADDR
-    lda #$A0            ; → PPU $23A0 (row 29, col 0)
+    lda #$A0
     sta PPUADDR
-    lda #$02            ; tile $02 = grass fill
+    lda #$02
     ldx #$00
 @row29:
     sta PPUDATA
@@ -230,185 +279,205 @@ attr_data:
     bne @row29
 
     ; --- Initialize Sam's starting position ---
-    lda #$78            ; X = 120 (centered)
+    lda #$78
     sta sam_x
-    lda #$B7            ; Y = 183 (top of Sam, feet land just above grass)
+    lda #$B7
     sta sam_y
 
-    ; --- Clear entire shadow OAM page to $FF (hides all 64 sprite slots) ---
-    ; DMA copies all 256 bytes of $0200–$02FF to PPU OAM every frame.
-    ; Any slot with Y < 240 is visible, so uninitialized slots = garbage sprites.
-    ; Setting Y = $FF puts every slot off-screen before we fill in the ones we need.
+    ; --- Clear entire shadow OAM to $FF (hides all 64 sprite slots) ---
     lda #$FF
     ldx #$00
 @clear_oam:
-    sta $0200,X         ; fill entire page with $FF
+    sta $0200,X
     inx
-    bne @clear_oam      ; inx wraps $FF→$00, so this loops exactly 256 times
+    bne @clear_oam
 
-    ; --- Copy Sam's OAM table into shadow RAM ($0200–$021F) ---
-    ; sam_oam is 8 sprites × 4 bytes = 32 bytes
+    ; --- Copy Sam's 6-sprite OAM entries into shadow RAM ---
     ldx #$00
 @sam_oam_loop:
     lda sam_oam,X
     sta $0200,X
     inx
-    cpx #$18            ; 24 bytes = 16 sprites
+    cpx #$18            ; 6 sprites × 4 bytes = 24 bytes
     bne @sam_oam_loop
 
-    ; --- Trigger initial OAM DMA ---
-    ; Copy shadow OAM ($0200–$02FF) → PPU's internal OAM memory
+    ; --- Initial OAM DMA ---
     lda #$00
-    sta $2003           ; OAMADDR = 0 (start DMA at beginning of PPU OAM)
+    sta $2003
     lda #$02
-    sta $4014           ; DMA page $02 → copies $0200–$02FF to PPU OAM
+    sta $4014
 
-    ; --- Set scroll position (must come after all PPUADDR writes) ---
+    ; --- Set scroll ---
     lda #$00
-    sta $2005           ; PPUSCROLL X = 0
-    sta $2005           ; PPUSCROLL Y = 0
+    sta $2005
+    sta $2005
 
     ; --- Enable rendering ---
-    lda #$1E            ; %00011110 = show sprites + background, show left-edge columns
+    lda #$1E
     sta PPUMASK
 
     ; --- Enable NMI ---
-    ; Without this, VBlank fires silently and nmi_handler never runs.
-    lda #$88            ; %10001000 = bit 7 NMI enable, bit 3 sprites use $1000, bit 4 BG uses $0000
+    lda #$88            ; bit 7 = NMI enable, bit 3 = sprites from $1000
     sta PPUCTRL
 
     ; --- Enable APU Pulse 1 ---
     lda #$01
     sta $4015           ; bit 0 = pulse 1 on
 
-    lda #$08            ; %00001000 — sweep disabled, negate=1, shift=0
-    sta $4001           ; negate bit prevents overflow silencing at low frequencies
+    lda #$08            ; sweep off; negate=1 prevents overflow silence at low freqs
+    sta $4001
 
-    ; --- Spin forever — all real work happens in nmi_handler ---
 @loop:
     jmp @loop
 
 .endproc
 
+
 ; =============================================================================
-; nmi_handler — called automatically by hardware at the start of every VBlank
-; (~60 times per second). This is where all per-frame updates happen.
+; nmi_handler — called every VBlank (~60×/sec)
 ;
-; VBlank is the only safe window to update PPU memory (palette, nametable, OAM).
-; We update our shadow OAM in CPU RAM, then DMA the whole buffer to PPU OAM.
+; Button read order is fixed by hardware: A, B, Select, Start, Up, Down, Left, Right
+; Each read of $4016 clocks out the next button in bit 0 (1=pressed, 0=not).
 ; =============================================================================
 .proc nmi_handler
-    ; --- Read controller 1 ---
-    ; Writing 1 then 0 to $4016 "strobes" the controller — it latches all button states.
-    ; After that, each read of $4016 returns the next button in bit 0 (1=pressed, 0=not).
-    ; Button order is fixed by hardware: A, B, Select, Start, Up, Down, Left, Right.
+    ; --- Strobe controller to latch all button states ---
     lda #$01
-    sta $4016           ; strobe on  — latch button states
+    sta $4016           ; strobe on
     lda #$00
-    sta $4016           ; strobe off — ready to clock out buttons one at a time
+    sta $4016           ; strobe off — buttons now clock out one at a time
 
-    sta moving          ; clear moving flag — $00 already in A from strobe off
+    ; Clear per-frame state
+    sta moving          ; $00 → moving
+    sta note_index      ; $00 → note_index (C4 default, overwritten if pressed)
 
-    lda $4016           ; A      — read and discard
-    lda $4016           ; B      — read and discard
-    lda $4016           ; Select — read and discard
-    lda $4016           ; Start  — read and discard
+    lda $4016           ; A      — discard
+    and #$01
+    beq @no_a
+    @no_a:
 
-    lda $4016           ; Up
-    and #$01            ; isolate bit 0 (the button state)
-    beq @no_up          ; 0 = not pressed, skip
-    dec sam_y           ; move Sam up (Y decreases toward top of screen)
-    lda #$01
-    sta moving
+    lda $4016           ; B      — discard
+    and #$01
+    beq @no_b
+    @no_b:
+
+    lda $4016           ; Select — discard
+    lda $4016           ; Start  — discard
+
+    ; --- Read directions: move Sam and record which note to play ---
+    ; note_index is set to the last pressed direction (Right wins if multiple held)
+
+    ; Up → G4 (index 4)
+    lda $4016
+    and #$01
+    beq @no_up
+        dec sam_y
+        lda #$01
+        sta moving
+        lda #$04
+        sta note_index
 @no_up:
 
-    lda $4016           ; Down
+    ; Down → A4 (index 5)
+    lda $4016
     and #$01
     beq @no_down
-    inc sam_y           ; move Sam down
-    lda #$01
-    sta moving
+        lda #$01
+        sta moving
+        lda #$05
+        sta note_index
+
+        inc sam_y
+        lda sam_y
+        cmp #$C0 ; carry set if sam_y >= $C0
+        bcc @no_down ; carry clear = still above grass, ok
+        lda #$BF ; past limit - snap back
+        sta sam_y
 @no_down:
 
-    lda $4016           ; Left
+    ; Left → E4 (index 2)
+    lda $4016
     and #$01
     beq @no_left
-    dec sam_x           ; move Sam left
-    lda #$01
-    sta moving
+        dec sam_x
+        lda #$01
+        sta moving
+        lda #$02
+        sta note_index
 @no_left:
 
-    lda $4016           ; Right
+    ; Right → C4 (index 0)
+    lda $4016
     and #$01
     beq @no_right
-    inc sam_x           ; move Sam right
-    lda #$01
-    sta moving
+        inc sam_x
+        lda #$01
+        sta moving
+        lda #$00
+        sta note_index
 @no_right:
 
-    ; --- Update shadow OAM with Sam's new position ---
-    ; Sam is 2 tiles wide × 4 tiles tall. Each tile is 8×8 pixels.
-    ; Left column X = sam_x, right column X = sam_x + 8.
-    ; Row Y positions step down by 8 each row.
-    ;
-    ; OAM entry format: [Y, tile, attributes, X]
-    ; We only update bytes 0 (Y) and 3 (X) — tile and attributes never change.
-
-    ; Y positions (byte 0 of each entry, 4 bytes apart)
-    lda sam_y
-    sta $0200           ; sprite 0 Y  (row 0, left)
-    sta $0204           ; sprite 1 Y  (row 0, right)
-    clc
-    adc #$08
-    sta $0208           ; sprite 2 Y  (row 1, left)
-    sta $020C           ; sprite 3 Y  (row 1, right)
-    clc
-    adc #$08
-    sta $0210           ; sprite 4 Y  (row 2, left)
-    sta $0214           ; sprite 5 Y  (row 2, right)
-
-    ; X positions (byte 3 of each entry)
-    lda sam_x
-    sta $0203           ; sprite 0 X  (left column, row 0)
-    sta $020B           ; sprite 2 X  (left column, row 1)
-    sta $0213           ; sprite 4 X  (left column, row 2)
-    clc
-    adc #$08
-    sta $0207           ; sprite 1 X  (right column, row 0)
-    sta $020F           ; sprite 3 X  (right column, row 1)
-    sta $0217           ; sprite 5 X  (right column, row 2)
-
-    ; --- Movement chirp ---
+    ; --- Sound timer: retrigger note every 16 frames while moving ---
+    ; Movement and note_index are now known. Sound decision happens here.
     lda moving
-    beq @no_moving_sound
-    inc sound_timer
-    lda sound_timer
-    cmp #$10
-    bne @no_moving_sound
+    bne @is_moving
+    jmp @silence        ; not moving — too far for beq, use invert+jmp
+@is_moving:
+        inc sound_timer
+        lda sound_timer
+        cmp #$10
+        beq @timer_done
+        jmp @skip_sound ; timer still counting — note keeps ringing, skip retrigger
+@timer_done:
         lda #$00
         sta sound_timer
-        lda #$BF        ; %10_11_1111
-                        ;   1111       volume:           1111 = 15 (max)
-                        ;   1          length halt:      1 = hold note (ignore length counter)
-                        ;   1          constant volume:  1 = fixed level (not envelope)
-                        ;  10          duty cycle:       10 = 50% square wave
+        ldx note_index
+        lda #$BF
         sta $4000
-        lda #$F1        ; A1 Note
+        lda note_lo,x
         sta $4002
-        lda #$0F        ; retrigger length counter, restart note
+        lda note_hi,x
+        ora #$08
         sta $4003
-        jmp @after_moving_sound
-@no_moving_sound:
-    lda #$00
-    sta $4000           ; silence when not moving
-@after_moving_sound:
+        jmp @skip_sound
 
-    ; --- Animation timer ---
+@silence:
+    lda #$00
+    sta sound_timer
+    sta $4000           ; silence
+
+@skip_sound:
+
+    ; --- Update shadow OAM: Y positions ---
+    ; Sam is 3 rows of 2 sprites each, stacked 8px apart
+    lda sam_y
+    sta $0200           ; row 0 left  Y
+    sta $0204           ; row 0 right Y
+    clc
+    adc #$08
+    sta $0208           ; row 1 left  Y
+    sta $020C           ; row 1 right Y
+    clc
+    adc #$08
+    sta $0210           ; row 2 left  Y
+    sta $0214           ; row 2 right Y
+
+    ; --- Update shadow OAM: X positions ---
+    lda sam_x
+    sta $0203           ; row 0 left  X
+    sta $020B           ; row 1 left  X
+    sta $0213           ; row 2 left  X
+    clc
+    adc #$08
+    sta $0207           ; row 0 right X
+    sta $020F           ; row 1 right X
+    sta $0217           ; row 2 right X
+
+    ; --- Animation: cycle frames while moving, reset when still ---
     lda moving
     bne @do_anim
-    lda #$00
-    sta anim_frame
-    jmp @skip_anim
+        lda #$00
+        sta anim_frame
+        jmp @skip_anim
 @do_anim:
     inc frame_timer
     lda frame_timer
@@ -420,70 +489,68 @@ attr_data:
         eor #$01
         sta anim_frame
 @skip_anim:
-    ; --- Update all 6 tile bytes in shadow OAM ---
-    ; Each row in anim_tiles is 4 bytes (2 per pose × 2 poses)
-    ; anim_frame=0 → offset 0, anim_frame=1 → offset 2
 
+    ; Update tile indices in shadow OAM for all 6 sprites
     lda anim_frame
-    asl                 ; 0→0, 1→2
+    asl                 ; × 2 → offset into anim_tiles row
     tax
 
-    lda anim_tiles,x    ; head left
+    lda anim_tiles,x    ; head tiles
     sta $0201
     inx
-    lda anim_tiles,x    ; head right
+    lda anim_tiles,x
     sta $0205
 
     lda anim_frame
     asl
     clc
-    adc #$04            ; skip to body row in table
+    adc #$04            ; body row offset
     tax
 
-    lda anim_tiles,x    ; body left
+    lda anim_tiles,x
     sta $0209
     inx
-    lda anim_tiles,x    ; body right
+    lda anim_tiles,x
     sta $020D
 
     lda anim_frame
     asl
     clc
-    adc #$08            ; skip to feet row in table
+    adc #$08            ; feet row offset
     tax
 
-    lda anim_tiles,x    ; feet left
+    lda anim_tiles,x
     sta $0211
     inx
-    lda anim_tiles,x    ; feet right
+    lda anim_tiles,x
     sta $0215
 
     ; --- DMA shadow OAM → PPU OAM ---
-    ; Push the updated shadow OAM to the PPU every frame without exception.
     lda #$00
-    sta $2003           ; OAMADDR = 0
+    sta $2003
     lda #$02
-    sta $4014           ; DMA page $02 → PPU OAM
+    sta $4014
 
     rti
 
 .endproc
 
+
 ; =============================================================================
-; irq_handler — we don't use IRQs (SEI disables them at startup)
+; irq_handler — IRQs are disabled (SEI in reset), this never runs
 ; =============================================================================
 .proc irq_handler
     rti
 .endproc
 
+
 ; =============================================================================
-; Interrupt vectors — hardware reads these addresses on startup and interrupts
-;   $FFFA–$FFFB  NMI vector   → address of nmi_handler
-;   $FFFC–$FFFD  Reset vector → address of reset_handler
-;   $FFFE–$FFFF  IRQ vector   → address of irq_handler
+; Interrupt vectors — hardware reads these on startup and interrupts
+;   $FFFA  NMI vector
+;   $FFFC  Reset vector
+;   $FFFE  IRQ vector
 ; =============================================================================
 .segment "VECTORS"
-    .word nmi_handler    ; $FFFA
-    .word reset_handler  ; $FFFC
-    .word irq_handler    ; $FFFE
-
+    .word nmi_handler
+    .word reset_handler
+    .word irq_handler
