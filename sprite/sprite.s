@@ -177,7 +177,7 @@ attr_data:
 ;   writing $4003 always retrriggers (restarts) the note
 ; =============================================================================
 .macro play_note index
-    lda #$BF
+    lda duty_cycle
     sta $4000
     ldx #index
     lda note_lo,x
@@ -340,6 +340,9 @@ attr_data:
 ; Each read of $4016 clocks out the next button in bit 0 (1=pressed, 0=not).
 ; =============================================================================
 .proc nmi_handler
+    lda #$BF            ; default square wave duty cycle
+    sta duty_cycle
+
     ; --- Strobe controller to latch all button states ---
     lda #$01
     sta $4016           ; strobe on
@@ -353,11 +356,15 @@ attr_data:
     lda $4016           ; A      — discard
     and #$01
     beq @no_a
+        lda #$FF
+        sta duty_cycle
     @no_a:
 
     lda $4016           ; B      — discard
     and #$01
     beq @no_b
+        lda #$3F
+        sta duty_cycle
     @no_b:
 
     lda $4016           ; Select — discard
@@ -431,7 +438,7 @@ attr_data:
         lda #$00
         sta sound_timer
         ldx note_index
-        lda #$BF
+        lda duty_cycle
         sta $4000
         lda note_lo,x
         sta $4002
