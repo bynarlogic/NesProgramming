@@ -87,6 +87,35 @@ note_hi:
     .byte $03   ; C3
 
 ; ---------------------------------------------------------------------------
+; Directional note tables — four notes stacked in perfect 4ths
+;
+; Starting from C2, each note is a perfect 4th (5 semitones) above the last.
+; Period formula (NTSC): period = 1,789,773 / (16 × freq) - 1
+;
+; Index:    0      1      2      3
+; Note:     C2     F2     Bb2    Eb3
+; Freq(Hz): 65.4   87.3   116.5  155.6
+; Period:   1709   1280    959    718
+;
+; Used by update_sound and assigned by update_player:
+;   0 = Down  (C2,  lowest)
+;   1 = Right (F2,  a 4th above Down)
+;   2 = Left  (Bb2, a 4th above Right)
+;   3 = Up    (Eb3, a 4th above Left, highest)
+; ---------------------------------------------------------------------------
+dir_note_lo:
+    .byte $AD   ; C2  period = $06AD
+    .byte $00   ; F2  period = $0500
+    .byte $BF   ; Bb2 period = $03BF
+    .byte $CE   ; Eb3 period = $02CE
+
+dir_note_hi:
+    .byte $06   ; C2
+    .byte $05   ; F2
+    .byte $03   ; Bb2
+    .byte $02   ; Eb3
+
+; ---------------------------------------------------------------------------
 ; Sam's OAM template — 6 sprite entries, 4 bytes each = 24 bytes
 ;
 ; OAM entry byte order: Y position, tile index, attributes, X position

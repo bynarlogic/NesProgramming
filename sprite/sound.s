@@ -53,9 +53,9 @@
     lda duty_cycle          ; waveform shape set by A/B buttons this frame
     sta APU_PULSE1_CTRL
     ldx note_index          ; runtime variable — which note did the player choose?
-    lda note_lo,x
+    lda dir_note_lo,x
     sta APU_PULSE1_LO
-    lda note_hi,x
+    lda dir_note_hi,x
     ora #$08                ; ensure length counter bits are nonzero (instant silence if $00)
     sta APU_PULSE1_HI       ; writing this register always retriggers the note
     jmp @done

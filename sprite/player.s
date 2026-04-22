@@ -81,25 +81,25 @@
     ; If multiple directions are held, the last one read wins (Right beats Left).
     ; This is because each direction overwrites note_index unconditionally.
 
-    ; Up → note index 4 (G2, ~98 Hz)
+    ; Up → dir note index 3 (Eb3, ~156 Hz) — highest pitch, a 4th above Left
     lda CONTROLLER1
     and #$01
     beq @no_up
         dec sam_y
         lda #$01
         sta moving
-        lda #$04
+        lda #$03
         sta note_index
 @no_up:
 
-    ; Down → note index 5 (A2, ~110 Hz)
+    ; Down → dir note index 0 (C2, ~65 Hz) — lowest pitch
     ; Includes a floor clamp: sam_y is capped at $BF so Sam can't walk into the grass.
     lda CONTROLLER1
     and #$01
     beq @no_down
         lda #$01
         sta moving
-        lda #$05
+        lda #$00
         sta note_index
         inc sam_y
         lda sam_y
@@ -109,7 +109,7 @@
         sta sam_y
 @no_down:
 
-    ; Left → note index 2 (E2, ~82 Hz)
+    ; Left → dir note index 2 (Bb2, ~117 Hz) — a 4th above Right
     lda CONTROLLER1
     and #$01
     beq @no_left
@@ -120,14 +120,14 @@
         sta note_index
 @no_left:
 
-    ; Right → note index 0 (C2, ~65 Hz)
+    ; Right → dir note index 1 (F2, ~87 Hz) — a 4th above Down
     lda CONTROLLER1
     and #$01
     beq @no_right
         inc sam_x
         lda #$01
         sta moving
-        lda #$00
+        lda #$01
         sta note_index
 @no_right:
 
